@@ -1,7 +1,9 @@
 #[macro_use]
 extern crate serde;
+
+use validator::Validate;
 use candid::{Decode, Encode};
-use ic_cdk::api::time;
+use ic_cdk::api::{time, caller};
 use ic_stable_structures::memory_manager::{MemoryId, MemoryManager, VirtualMemory};
 use ic_stable_structures::{BoundedStorable, Cell, DefaultMemoryImpl, StableBTreeMap, Storable};
 use std::{borrow::Cow, cell::RefCell};
@@ -53,21 +55,36 @@ thread_local! {
         RefCell::new(StableBTreeMap::init(
             MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(1)))
         ));
+
+    static ID_CUSTOMER_COUNTER: RefCell<IdCell> = RefCell::new(
+            IdCell::init(MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(4))), 0)
+                .expect("Cannot create a counter")
+        );
 }
 
-#[derive(candid::CandidType, Serialize, Deserialize, Default)]
+#[derive(candid::CandidType, Serialize, Deserialize, Default, Validate)]
 struct CarPayload {
+    #[validate(length(min = 2))]
     make: String,
+    #[validate(length(min = 2))]
     model: String,
+    #[validate(range(min = 1880, max=2024))]
     year: u32,
+    #[validate(length(min = 1))]
     color: String,
-    owner: String,
     is_booked: bool, // Add is_booked field to payload
 }
 
-#[derive(candid::CandidType, Serialize, Deserialize, Default, Clone)]
+#[derive(candid::CandidType, Serialize, Deserialize, Default, Clone, Validate)]
 struct Customer {
     id: u64,
+    name: String,
+    contact: String,
+}
+
+#[derive(candid::CandidType, Serialize, Deserialize, Default, Validate)]
+struct CustomerPayload {
+    #[validate(length(min = 1))]
     name: String,
     contact: String,
 }
@@ -120,7 +137,12 @@ fn get_car(id: u64) -> Result<Car, Error> {
 }
 
 #[ic_cdk::update]
-fn add_car(car: CarPayload) -> Option<Car> {
+fn add_car(car: CarPayload) -> Result<Car, Error> {
+    let check_payload = car.validate();
+    // if input validation fails, return an error
+    if check_payload.is_err(){
+        return Err(Error::ValidationErrors { errors:  check_payload.err().unwrap().to_string()})
+    }
     let id = ID_COUNTER
         .with(|counter| {
             let current_value = *counter.borrow().get();
@@ -135,23 +157,37 @@ fn add_car(car: CarPayload) -> Option<Car> {
         color: car.color,
         created_at: time(),
         updated_at: None,
-        owner: car.owner,
+        owner: caller().to_string(),
         is_booked: car.is_booked, // Set is_booked from payload
     };
     do_insert_car(&car);
-    Some(car)
+    Ok(car)
 }
 
 #[ic_cdk::update]
 fn update_car(id: u64, payload: CarPayload) -> Result<Car, Error> {
+    let check_payload = payload.validate();
+    // if input validation fails, return an error
+    if check_payload.is_err(){
+        return Err(Error::ValidationErrors { errors:  check_payload.err().unwrap().to_string()})
+    }
     match CAR_STORAGE.with(|service| service.borrow().get(&id)) {
         Some(mut car) => {
+            // if caller isn't the owner of car, return an error
+            if !_check_if_owner(&car){
+                return Err(Error::NotAuthorized {
+                    msg: format!(
+                        "Unauthorized to update car with id={}. car not found",
+                        id
+                    ),
+                })
+            }
+
             car.make = payload.make;
             car.model = payload.model;
             car.year = payload.year;
             car.color = payload.color;
             car.updated_at = Some(time());
-            car.owner = payload.owner;
             car.is_booked = payload.is_booked; // Update is_booked field
             do_insert_car(&car);
             Ok(car)
@@ -181,8 +217,21 @@ fn do_insert_car(car: &Car) {
 
 #[ic_cdk::update]
 fn delete_car(id: u64) -> Result<Car, Error> {
-    match CAR_STORAGE.with(|service| service.borrow_mut().remove(&id)) {
-        Some(car) => Ok(car),
+    match CAR_STORAGE.with(|service| service.borrow_mut().get(&id)) {
+        Some(car) => {
+             // if caller isn't the owner of car, return an error
+            if !_check_if_owner(&car){
+                return Err(Error::NotAuthorized {
+                    msg: format!(
+                        "Unauthorized to delete car with id={}. car not found",
+                        id
+                    ),
+                })
+            }
+            CAR_STORAGE.with(|service| service.borrow_mut().remove(&id));
+            Ok(car)
+        
+        },
         None => Err(Error::NotFound {
             msg: format!(
                 "couldn't delete a car with id={}. car not found.",
@@ -193,8 +242,11 @@ fn delete_car(id: u64) -> Result<Car, Error> {
 }
 
 #[ic_cdk::update]
-fn add_customer(name: String, contact: String) -> Option<Customer> {
-    let id = ID_COUNTER
+fn add_customer(payload: CustomerPayload) -> Option<Customer> {
+    let check_payload = payload.validate();
+    // checks if payload passed validations
+    assert!(check_payload.is_ok(),"errors: {}.", check_payload.err().unwrap());
+    let id = ID_CUSTOMER_COUNTER
         .with(|counter| {
             let current_value = *counter.borrow().get();
             counter.borrow_mut().set(current_value + 1)
@@ -202,8 +254,8 @@ fn add_customer(name: String, contact: String) -> Option<Customer> {
         .expect("cannot increment id counter");
     let customer = Customer {
         id,
-        name,
-        contact,
+        name: payload.name,
+        contact: payload.contact,
     };
     do_insert_customer(&customer);
     Some(customer)
@@ -255,7 +307,10 @@ fn delete_customer(id: u64) -> Result<Customer, Error> {
 #[ic_cdk::update]
 fn make_reservation(car_id: u64, customer_id: u64) -> Result<Reservation, Error> {
     match (_get_car(&car_id), _get_customer(&customer_id)) {
-        (Some(_), Some(_)) => {
+        (Some(car), Some(_)) => {
+            if car.is_booked {
+                return Err(Error::AlreadyBooked { msg: format!("Car with id={} is already booked.", car_id) })
+            }
             let reservation = Reservation {
                 car_id,
                 customer_id,
@@ -329,7 +384,10 @@ fn generate_report() -> Vec<Car> {
 
 #[derive(candid::CandidType, Deserialize, Serialize)]
 enum Error {
+    ValidationErrors {errors: String},
     NotFound { msg: String },
+    NotAuthorized {msg: String},
+    AlreadyBooked {msg: String}
 }
 
 fn _get_car(id: &u64) -> Option<Car> {
@@ -338,6 +396,15 @@ fn _get_car(id: &u64) -> Option<Car> {
     StableBTreeMap::<u64, Car, Memory>::init(car_storage)
         .borrow()
         .get(id)
+}
+
+// Helper function to check whether the caller is the author of the blog post
+fn _check_if_owner(car: &Car) -> bool {
+    if car.owner.to_string() != caller().to_string(){
+        false  
+    }else{
+        true
+    }
 }
 
 ic_cdk::export_candid!();
